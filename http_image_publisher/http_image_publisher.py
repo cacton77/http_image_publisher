@@ -10,13 +10,15 @@ import numpy as np
 import time
 import threading
 from enum import Enum
+from queue import Queue, Empty
+from PIL import Image as PILImage
+from io import BytesIO
 
 
 class ConnectionState(Enum):
     DISCONNECTED = 1
     CONNECTING = 2
     CONNECTED = 3
-    RECONNECTING = 4
 
 
 class HttpImagePublisher(Node):
@@ -27,16 +29,9 @@ class HttpImagePublisher(Node):
         self.declare_parameter('stream_url', 'http://example.com/stream.mjpg')
         self.declare_parameter('base_topic', 'camera')
         self.declare_parameter('frame_id', 'camera_frame')
-        self.declare_parameter('publish_rate', 30.0)
         self.declare_parameter('connection_timeout', 5.0)
-        self.declare_parameter('use_opencv', True)
-
-        # Reconnection parameters
-        self.declare_parameter('max_reconnection_attempts', 0)  # 0 = infinite
-        self.declare_parameter('initial_reconnect_delay', 1.0)  # seconds
-        self.declare_parameter('max_reconnect_delay', 30.0)  # seconds
-        self.declare_parameter('backoff_multiplier', 2.0)
-        self.declare_parameter('connection_check_interval', 1.0)  # seconds
+        self.declare_parameter('use_opencv_for_mjpeg', True)
+        self.declare_parameter('use_pillow', True)
 
         # Camera calibration parameters
         self.declare_parameter('camera_name', 'http_camera')
@@ -51,22 +46,11 @@ class HttpImagePublisher(Node):
         self.stream_url = self.get_parameter('stream_url').value
         self.base_topic = self.get_parameter('base_topic').value
         self.frame_id = self.get_parameter('frame_id').value
-        self.publish_rate = self.get_parameter('publish_rate').value
         self.connection_timeout = self.get_parameter(
             'connection_timeout').value
-        self.use_opencv = self.get_parameter('use_opencv').value
-
-        # Reconnection parameters
-        self.max_reconnection_attempts = self.get_parameter(
-            'max_reconnection_attempts').value
-        self.initial_reconnect_delay = self.get_parameter(
-            'initial_reconnect_delay').value
-        self.max_reconnect_delay = self.get_parameter(
-            'max_reconnect_delay').value
-        self.backoff_multiplier = self.get_parameter(
-            'backoff_multiplier').value
-        self.connection_check_interval = self.get_parameter(
-            'connection_check_interval').value
+        self.use_opencv_for_mjpeg = self.get_parameter(
+            'use_opencv_for_mjpeg').value
+        self.use_pillow = self.get_parameter('use_pillow').value
 
         # Camera info parameters
         self.camera_name = self.get_parameter('camera_name').value
@@ -88,45 +72,44 @@ class HttpImagePublisher(Node):
         # Connection state management
         self.connection_state = ConnectionState.DISCONNECTED
         self.connection_lock = threading.Lock()
-        self.reconnection_attempts = 0
-        self.current_reconnect_delay = self.initial_reconnect_delay
-        self.last_successful_frame_time = time.time()
-        self.reconnection_thread = None
         self.shutdown_requested = False
 
         # Stream handling
         self.cap = None
         self.stream_session = None
         self.is_mjpeg_stream = False
+        self.use_pillow_method = False
         self.actual_width = self.image_width
         self.actual_height = self.image_height
 
+        # Frame grabbing thread
+        self.frame_queue = Queue(maxsize=1)
+        self.frame_thread = None
+        self.frame_thread_active = False
+
         # Frame statistics
         self.frames_received = 0
+        self.frames_published = 0
         self.last_stats_time = time.time()
-        self.stats_timer = self.create_timer(
-            10.0, self.print_stats)  # Print stats every 10 seconds
+        self.grab_times = []
+        self.publish_times = []
+        self.stats_timer = self.create_timer(10.0, self.print_stats)
 
         # Initialize camera info message
         self.setup_camera_info()
 
-        # Start connection monitoring
-        self.connection_monitor_timer = self.create_timer(
-            self.connection_check_interval, self.monitor_connection)
-
-        # Create timer for publishing
-        timer_period = 1.0 / self.publish_rate
-        self.timer = self.create_timer(timer_period, self.timer_callback)
+        # Publishing timer - runs fast to publish frames as soon as available
+        self.publish_timer = self.create_timer(0.001, self.publish_callback)
 
         # Start initial connection
         self.start_connection()
 
         self.get_logger().info(
-            f'HTTP Image Publisher initialized for {self.stream_url}')
+            f'Low-latency HTTP Image Publisher initialized for {self.stream_url}')
         self.get_logger().info(
-            f'Publishing to {self.base_topic}/image_raw at {self.publish_rate} Hz')
-        self.get_logger().info(f'Reconnection settings: max_attempts={self.max_reconnection_attempts}, '
-                               f'initial_delay={self.initial_reconnect_delay}s, max_delay={self.max_reconnect_delay}s')
+            f'Publishing to {self.base_topic}/image_raw (continuous mode)')
+        self.get_logger().info(
+            f'Using Pillow: {self.use_pillow}, OpenCV for MJPEG: {self.use_opencv_for_mjpeg}')
 
     def setup_camera_info(self):
         """Setup camera info message with calibration data"""
@@ -157,13 +140,12 @@ class HttpImagePublisher(Node):
     def start_connection(self):
         """Start the initial connection attempt"""
         with self.connection_lock:
-            if self.connection_state in [ConnectionState.CONNECTING, ConnectionState.RECONNECTING]:
+            if self.connection_state == ConnectionState.CONNECTING:
                 return
 
             self.connection_state = ConnectionState.CONNECTING
             self.get_logger().info('Starting connection to stream...')
 
-        # Start connection in a separate thread to avoid blocking
         connection_thread = threading.Thread(target=self._attempt_connection)
         connection_thread.daemon = True
         connection_thread.start()
@@ -173,7 +155,7 @@ class HttpImagePublisher(Node):
         try:
             self.get_logger().info(f'Connecting to {self.stream_url}')
 
-            # First, check what type of stream this is
+            # Check stream type
             test_response = requests.head(
                 self.stream_url, timeout=self.connection_timeout)
             content_type = test_response.headers.get('content-type', '')
@@ -181,15 +163,20 @@ class HttpImagePublisher(Node):
 
             success = False
 
-            if 'multipart' in content_type and self.use_opencv:
-                # Try OpenCV first for MJPEG streams
-                self.get_logger().info('Attempting OpenCV VideoCapture for MJPEG stream')
+            if 'multipart' in content_type and self.use_opencv_for_mjpeg:
+                # OpenCV for MJPEG streams
+                self.get_logger().info('Using OpenCV VideoCapture for MJPEG stream')
                 cap = cv2.VideoCapture(self.stream_url)
+
+                # Configure for lowest latency
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FPS, self.publish_rate)
 
                 if cap.isOpened():
-                    # Test read and get actual dimensions
+                    # Clear any buffered frames
+                    for _ in range(5):
+                        cap.grab()
+
+                    # Test read
                     ret, frame = cap.read()
                     if ret and frame is not None:
                         with self.connection_lock:
@@ -199,6 +186,7 @@ class HttpImagePublisher(Node):
                             self.actual_height, self.actual_width = frame.shape[:2]
                             self.update_camera_info_dimensions()
                             self.is_mjpeg_stream = True
+                            self.use_pillow_method = False
                             success = True
                         self.get_logger().info(
                             f'OpenCV connection successful - {self.actual_width}x{self.actual_height}')
@@ -207,12 +195,36 @@ class HttpImagePublisher(Node):
                 else:
                     cap.release()
 
-            if not success:
-                # Fallback to requests method
-                self.get_logger().info('Using requests method for image fetching')
+            if not success and self.use_pillow:
+                # Try Pillow method for single images
+                self.get_logger().info('Using Pillow for image fetching')
                 session = requests.Session()
 
-                # Test the connection with a quick request
+                # Test the connection
+                test_response = session.get(
+                    self.stream_url, timeout=self.connection_timeout, stream=True)
+                test_response.raise_for_status()
+
+                # Test decode with Pillow
+                pil_image = PILImage.open(BytesIO(test_response.content))
+                pil_image.load()  # Force load to ensure it's valid
+
+                test_response.close()
+
+                with self.connection_lock:
+                    if self.stream_session:
+                        self.stream_session.close()
+                    self.stream_session = session
+                    self.is_mjpeg_stream = False
+                    self.use_pillow_method = True
+                    success = True
+                self.get_logger().info('Pillow connection successful')
+
+            elif not success:
+                # Fallback to requests + OpenCV decode
+                self.get_logger().info('Using requests + OpenCV decode method')
+                session = requests.Session()
+
                 test_response = session.get(
                     self.stream_url, timeout=self.connection_timeout, stream=True)
                 test_response.raise_for_status()
@@ -223,15 +235,16 @@ class HttpImagePublisher(Node):
                         self.stream_session.close()
                     self.stream_session = session
                     self.is_mjpeg_stream = False
+                    self.use_pillow_method = False
                     success = True
-                self.get_logger().info('Requests connection successful')
+                self.get_logger().info('Requests + OpenCV connection successful')
 
             if success:
                 with self.connection_lock:
                     self.connection_state = ConnectionState.CONNECTED
-                    self.reconnection_attempts = 0
-                    self.current_reconnect_delay = self.initial_reconnect_delay
-                    self.last_successful_frame_time = time.time()
+
+                # Start frame grabbing thread
+                self.start_frame_thread()
                 self.get_logger().info('Stream connection established successfully')
             else:
                 raise Exception(
@@ -241,154 +254,163 @@ class HttpImagePublisher(Node):
             self.get_logger().error(f'Connection attempt failed: {e}')
             with self.connection_lock:
                 self.connection_state = ConnectionState.DISCONNECTED
-            self._schedule_reconnection()
 
-    def _schedule_reconnection(self):
-        """Schedule a reconnection attempt"""
-        if self.shutdown_requested:
+    def start_frame_thread(self):
+        """Start the continuous frame grabbing thread"""
+        if self.frame_thread and self.frame_thread.is_alive():
             return
 
-        with self.connection_lock:
-            if self.max_reconnection_attempts > 0 and self.reconnection_attempts >= self.max_reconnection_attempts:
-                self.get_logger().error(
-                    f'Maximum reconnection attempts ({self.max_reconnection_attempts}) reached. Giving up.')
-                return
+        self.frame_thread_active = True
+        self.frame_thread = threading.Thread(target=self._frame_grabbing_loop)
+        self.frame_thread.daemon = True
+        self.frame_thread.start()
+        self.get_logger().info('Frame grabbing thread started')
 
-            self.reconnection_attempts += 1
-            self.connection_state = ConnectionState.RECONNECTING
+    def stop_frame_thread(self):
+        """Stop the frame grabbing thread"""
+        self.frame_thread_active = False
+        if self.frame_thread:
+            self.frame_thread.join(timeout=2.0)
+        self.get_logger().info('Frame grabbing thread stopped')
 
-        delay = min(self.current_reconnect_delay, self.max_reconnect_delay)
-        self.get_logger().info(
-            f'Scheduling reconnection attempt #{self.reconnection_attempts} in {delay:.1f} seconds')
+    def _frame_grabbing_loop(self):
+        """Continuously grab frames and put latest in queue"""
+        consecutive_failures = 0
+        max_failures = 30
 
-        # Start reconnection timer
-        if self.reconnection_thread and self.reconnection_thread.is_alive():
-            return  # Already have a reconnection scheduled
+        while self.frame_thread_active and not self.shutdown_requested:
+            try:
+                grab_start = time.time()
 
-        self.reconnection_thread = threading.Thread(
-            target=self._reconnection_worker, args=(delay,))
-        self.reconnection_thread.daemon = True
-        self.reconnection_thread.start()
+                with self.connection_lock:
+                    cap = self.cap
+                    session = self.stream_session
+                    state = self.connection_state
+                    use_pillow = self.use_pillow_method
 
-        # Increase delay for next attempt
-        self.current_reconnect_delay *= self.backoff_multiplier
+                if state != ConnectionState.CONNECTED:
+                    time.sleep(0.1)
+                    continue
 
-    def _reconnection_worker(self, delay):
-        """Worker thread for handling reconnection delays"""
-        time.sleep(delay)
-        if not self.shutdown_requested:
-            self._attempt_connection()
+                frame = None
 
-    def monitor_connection(self):
-        """Monitor connection health and trigger reconnection if needed"""
-        if self.shutdown_requested:
-            return
+                if cap is not None:
+                    # OpenCV MJPEG stream - aggressively clear buffer
+                    for _ in range(3):
+                        cap.grab()
+                    ret, frame = cap.retrieve()
 
-        with self.connection_lock:
-            current_state = self.connection_state
+                    if not ret or frame is None:
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_failures:
+                            self.get_logger().error('Too many consecutive frame failures - connection lost')
+                            self._handle_connection_loss()
+                            break
+                        continue
 
-        if current_state == ConnectionState.CONNECTED:
-            # Check if we've received frames recently
-            time_since_last_frame = time.time() - self.last_successful_frame_time
-            if time_since_last_frame > 5.0:  # No frames for 5 seconds
-                self.get_logger().warn(
-                    f'No frames received for {time_since_last_frame:.1f} seconds, triggering reconnection')
-                self._handle_connection_loss()
-        elif current_state == ConnectionState.DISCONNECTED:
-            # Try to reconnect if we're not already trying
-            self.start_connection()
+                    consecutive_failures = 0
 
-    def _handle_connection_loss(self):
-        """Handle loss of connection"""
-        with self.connection_lock:
-            self.connection_state = ConnectionState.DISCONNECTED
+                elif session is not None:
+                    if use_pillow:
+                        frame = self.get_single_image_pillow(session)
+                    else:
+                        frame = self.get_single_image_opencv(session)
 
-            # Clean up current connections
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            if self.stream_session:
-                self.stream_session.close()
-                self.stream_session = None
+                    if frame is None:
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_failures:
+                            self.get_logger().error('Too many consecutive frame failures - connection lost')
+                            self._handle_connection_loss()
+                            break
+                        continue
 
-        self.get_logger().warn('Connection lost, attempting to reconnect...')
-        self._schedule_reconnection()
+                    consecutive_failures = 0
 
-    def update_camera_info_dimensions(self):
-        """Update camera info with actual image dimensions"""
-        if self.actual_width != self.image_width or self.actual_height != self.image_height:
-            # Scale camera matrix for different resolution
-            scale_x = self.actual_width / self.image_width
-            scale_y = self.actual_height / self.image_height
-
-            self.camera_info_msg.width = self.actual_width
-            self.camera_info_msg.height = self.actual_height
-
-            # Scale camera matrix
-            scaled_matrix = self.camera_matrix.copy()
-            scaled_matrix[0] *= scale_x  # fx
-            scaled_matrix[2] *= scale_x  # cx
-            scaled_matrix[4] *= scale_y  # fy
-            scaled_matrix[5] *= scale_y  # cy
-
-            self.camera_info_msg.k = scaled_matrix
-
-            # Update projection matrix
-            self.camera_info_msg.p = [
-                scaled_matrix[0], 0.0, scaled_matrix[2], 0.0,
-                0.0, scaled_matrix[4], scaled_matrix[5], 0.0,
-                0.0, 0.0, 1.0, 0.0
-            ]
-
-    def timer_callback(self):
-        """Timer callback to fetch and publish images"""
-        with self.connection_lock:
-            current_state = self.connection_state
-            cap = self.cap
-            session = self.stream_session
-
-        if current_state != ConnectionState.CONNECTED or (cap is None and session is None):
-            return
-
-        try:
-            frame = None
-
-            if cap is not None:
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    self.get_logger().debug('OpenCV read failed')
-                    self._handle_connection_loss()
-                    return
-
-                frame = np.asarray(frame)
-                if frame.dtype != np.uint8:
-                    frame = frame.astype(np.uint8)
-                if not frame.flags.c_contiguous:
-                    frame = np.ascontiguousarray(frame)
-
-            elif session is not None:
-                frame = self.get_single_image(session)
-                if frame is not None:
-                    # Update dimensions if first frame
+                    # Update dimensions on first frame
                     if self.actual_width == self.image_width and self.actual_height == self.image_height:
                         self.actual_height, self.actual_width = frame.shape[:2]
                         self.update_camera_info_dimensions()
 
-            # Validate and publish frame
-            if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
-                self.publish_image_and_info(frame)
-                self.last_successful_frame_time = time.time()
-                self.frames_received += 1
-            else:
-                self.get_logger().debug('Invalid frame received')
+                # Put frame in queue
+                if frame is not None and isinstance(frame, np.ndarray) and frame.size > 0:
+                    if len(frame.shape) == 3 and frame.shape[2] == 3:
+                        # Clear queue and put latest frame
+                        while not self.frame_queue.empty():
+                            try:
+                                self.frame_queue.get_nowait()
+                            except Empty:
+                                break
+
+                        try:
+                            self.frame_queue.put_nowait(frame)
+                            self.frames_received += 1
+
+                            # Track timing
+                            grab_time = time.time() - grab_start
+                            self.grab_times.append(grab_time)
+                            if len(self.grab_times) > 100:
+                                self.grab_times.pop(0)
+                        except:
+                            pass
+
+            except Exception as e:
+                self.get_logger().error(f'Error in frame grabbing loop: {e}')
                 self._handle_connection_loss()
+                break
+
+        self.get_logger().info('Frame grabbing loop exited')
+
+    def publish_callback(self):
+        """Fast callback to publish frames as soon as they're available"""
+        try:
+            publish_start = time.time()
+
+            # Non-blocking get
+            frame = self.frame_queue.get_nowait()
+            self.publish_image_and_info(frame)
+            self.frames_published += 1
+
+            # Track timing
+            publish_time = time.time() - publish_start
+            self.publish_times.append(publish_time)
+            if len(self.publish_times) > 100:
+                self.publish_times.pop(0)
+        except Empty:
+            pass
+        except Exception as e:
+            self.get_logger().error(f'Error in publish callback: {e}')
+
+    def get_single_image_pillow(self, session):
+        """Fetch a single image from the URL using Pillow"""
+        try:
+            response = session.get(
+                self.stream_url, timeout=self.connection_timeout)
+            response.raise_for_status()
+
+            if not response.content:
+                return None
+
+            # Decode with Pillow
+            pil_image = PILImage.open(BytesIO(response.content))
+
+            # Convert to RGB if necessary
+            if pil_image.mode != 'RGB':
+                pil_image = pil_image.convert('RGB')
+
+            # Convert to numpy array (RGB format)
+            frame_rgb = np.array(pil_image, dtype=np.uint8)
+
+            # Convert RGB to BGR for ROS compatibility
+            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+            return frame_bgr
 
         except Exception as e:
-            self.get_logger().error(f'Error in timer callback: {e}')
-            self._handle_connection_loss()
+            self.get_logger().debug(f'Error fetching image with Pillow: {e}')
+            return None
 
-    def get_single_image(self, session):
-        """Fetch a single image from the URL using requests"""
+    def get_single_image_opencv(self, session):
+        """Fetch a single image from the URL using OpenCV decode"""
         try:
             response = session.get(
                 self.stream_url, timeout=self.connection_timeout)
@@ -405,29 +427,19 @@ class HttpImagePublisher(Node):
             return frame
 
         except Exception as e:
-            self.get_logger().debug(f'Error fetching single image: {e}')
+            self.get_logger().debug(f'Error fetching image with OpenCV: {e}')
             return None
 
     def publish_image_and_info(self, cv_image):
         """Publish both image and camera info with synchronized timestamps"""
         try:
-            # Validation
-            if not isinstance(cv_image, np.ndarray) or cv_image.size == 0:
+            if cv_image.size == 0 or len(cv_image.shape) != 3:
                 return
-
-            if len(cv_image.shape) != 3 or cv_image.shape[2] != 3:
-                return
-
-            # Ensure proper format
-            if cv_image.dtype != np.uint8:
-                cv_image = cv_image.astype(np.uint8)
-            if not cv_image.flags.c_contiguous:
-                cv_image = np.ascontiguousarray(cv_image)
 
             # Create timestamp
             timestamp = self.get_clock().now().to_msg()
 
-            # Create and publish image message (keeping BGR format for ROS)
+            # Create and publish image message
             ros_image = self.bridge.cv2_to_imgmsg(cv_image, encoding='bgr8')
             ros_image.header.stamp = timestamp
             ros_image.header.frame_id = self.frame_id
@@ -440,35 +452,83 @@ class HttpImagePublisher(Node):
         except Exception as e:
             self.get_logger().error(f'Image publishing error: {e}')
 
+    def update_camera_info_dimensions(self):
+        """Update camera info with actual image dimensions"""
+        if self.actual_width != self.image_width or self.actual_height != self.image_height:
+            scale_x = self.actual_width / self.image_width
+            scale_y = self.actual_height / self.image_height
+
+            self.camera_info_msg.width = self.actual_width
+            self.camera_info_msg.height = self.actual_height
+
+            scaled_matrix = list(self.camera_matrix)
+            scaled_matrix[0] *= scale_x
+            scaled_matrix[2] *= scale_x
+            scaled_matrix[4] *= scale_y
+            scaled_matrix[5] *= scale_y
+
+            self.camera_info_msg.k = scaled_matrix
+
+            self.camera_info_msg.p = [
+                scaled_matrix[0], 0.0, scaled_matrix[2], 0.0,
+                0.0, scaled_matrix[4], scaled_matrix[5], 0.0,
+                0.0, 0.0, 1.0, 0.0
+            ]
+
+    def _handle_connection_loss(self):
+        """Handle loss of connection"""
+        self.stop_frame_thread()
+
+        with self.connection_lock:
+            self.connection_state = ConnectionState.DISCONNECTED
+
+            if self.cap:
+                self.cap.release()
+                self.cap = None
+            if self.stream_session:
+                self.stream_session.close()
+                self.stream_session = None
+
+        self.get_logger().error('Connection lost - node stopping')
+
     def print_stats(self):
         """Print connection statistics"""
         current_time = time.time()
         time_elapsed = current_time - self.last_stats_time
-        fps = self.frames_received / time_elapsed if time_elapsed > 0 else 0
+
+        grabbed_fps = self.frames_received / time_elapsed if time_elapsed > 0 else 0
+        published_fps = self.frames_published / time_elapsed if time_elapsed > 0 else 0
+        queue_size = self.frame_queue.qsize()
 
         with self.connection_lock:
             state = self.connection_state
 
-        self.get_logger().info(f'Stats: State={state.name}, FPS={fps:.1f}, '
-                               f'Total_frames={self.frames_received}, '
-                               f'Reconnect_attempts={self.reconnection_attempts}')
+        # Calculate average times
+        avg_grab_time = sum(self.grab_times) / \
+            len(self.grab_times) if self.grab_times else 0
+        avg_publish_time = sum(self.publish_times) / \
+            len(self.publish_times) if self.publish_times else 0
+
+        self.get_logger().info(
+            f'Stats: State={state.name}, Grabbed={grabbed_fps:.1f}fps, '
+            f'Published={published_fps:.1f}fps, QueueSize={queue_size}')
+        self.get_logger().info(
+            f'Timing: AvgGrab={avg_grab_time*1000:.1f}ms, AvgPublish={avg_publish_time*1000:.1f}ms')
 
         self.frames_received = 0
+        self.frames_published = 0
         self.last_stats_time = current_time
 
     def destroy_node(self):
         """Clean up resources when node is destroyed"""
         self.shutdown_requested = True
+        self.stop_frame_thread()
 
         with self.connection_lock:
             if self.cap:
                 self.cap.release()
             if self.stream_session:
                 self.stream_session.close()
-
-        # Wait for reconnection thread to finish
-        if self.reconnection_thread and self.reconnection_thread.is_alive():
-            self.reconnection_thread.join(timeout=1.0)
 
         super().destroy_node()
 

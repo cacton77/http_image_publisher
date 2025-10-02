@@ -5,15 +5,21 @@ from launch_ros.actions import Node
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 
+
 def generate_launch_description():
     declared_arguments = [
-        DeclareLaunchArgument("stream_url", default_value='http://192.168.0.92:5000/video_feed', description='URL of the video stream'),
-        DeclareLaunchArgument("base_topic", default_value='camera', description='Base topic for the camera'),
-        DeclareLaunchArgument("frame_id", default_value='camera_frame', description='Frame ID for the camera'),
-        DeclareLaunchArgument("publish_rate", default_value='30.0', description='Publish rate for the camera'),
-        DeclareLaunchArgument("connection_timeout", default_value='5.0', description='Connection timeout for the stream')
+        DeclareLaunchArgument(
+            "stream_url", default_value='http://192.168.0.92:5000/video_feed', description='URL of the video stream'),
+        DeclareLaunchArgument(
+            "base_topic", default_value='camera', description='Base topic for the camera'),
+        DeclareLaunchArgument(
+            "frame_id", default_value='camera_frame', description='Frame ID for the camera'),
+        DeclareLaunchArgument("publish_rate", default_value='30.0',
+                              description='Publish rate for the camera'),
+        DeclareLaunchArgument("connection_timeout", default_value='5.0',
+                              description='Connection timeout for the stream')
     ]
-    return LaunchDescription([
+    return LaunchDescription(declared_arguments + [
         # HTTP Image Publisher
         Node(
             package='http_image_publisher',
